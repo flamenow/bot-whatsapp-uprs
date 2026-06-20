@@ -313,7 +313,7 @@ async function processarMensagem(numero, texto, tipoMsg, mediaBase64, contextoGr
   }
 
   // INDICAR — filiado adiciona contato de pessoa interessada
-  if (['/contato', 'indicar', 'contato', 'interessado'].includes(cmd)) {
+  if (['contato', 'indicar', 'interessado'].includes(cmd)) {
     if (!membro) {
       await enviarMsg(numero, `❓ Só filiados podem indicar contatos. Fala com a direção do seu núcleo.`);
       return;
@@ -399,7 +399,7 @@ async function processarMensagem(numero, texto, tipoMsg, mediaBase64, contextoGr
     `📚 *livros* — ver livros disponíveis\n` +
     `📅 *agenda* — próximos eventos\n` +
     `🌐 *cadastro* — acessar o portal UP-RS\n` +
-    `👥 */contato* — registrar contato de pessoa interessada`
+    `👥 *contato* — registrar contato de pessoa interessada`
   );
 }
 
@@ -433,17 +433,21 @@ app.post('/webhook', async (req, res) => {
   else texto = '';
 
   if (isGrupo) {
-    // Só processa se começar com o prefixo /up
     const trimmed = (texto || '').trim();
-    if (!trimmed.toLowerCase().startsWith(PREFIXO)) return;
+    const trimmedLower = trimmed.toLowerCase();
+
+    // Aceita /up <comando> ou /contato diretamente
+    const ehComandoUp      = trimmedLower.startsWith(PREFIXO);
+    const ehComandoContato = trimmedLower === '/contato';
+
+    if (!ehComandoUp && !ehComandoContato) return;
 
     // Quem enviou no grupo
     numero        = (key.participant || '').replace('@s.whatsapp.net', '');
-    texto         = trimmed.slice(PREFIXO.length).trim(); // remove "/up " do início
+    texto         = ehComandoContato ? 'contato' : trimmed.slice(PREFIXO.length).trim();
     contextoGrupo = { grupoJid: key.remoteJid };
 
     // Avisa no grupo que vai responder no privado
-    const nome = numero; // será substituído pelo nome real dentro de processarMensagem se encontrar
     await enviarMsg(key.remoteJid, `📬 Te respondi no privado!`);
   } else {
     numero = key.remoteJid.replace('@s.whatsapp.net', '');
