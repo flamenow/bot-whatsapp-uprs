@@ -338,7 +338,7 @@ app.post('/webhook', async (req, res) => {
     texto         = ehComandoContato ? 'contato' : trimmed.slice(PREFIXO.length).trim();
     contextoGrupo = { grupoJid: key.remoteJid };
 
-    await enviarMsg(key.remoteJid, 'Te respondi no privado!');
+    await enviarMsg(key.remoteJid, 'Te respondi no privado! [debug: ' + numero + ']');
   } else {
     numero = key.remoteJid.replace('@s.whatsapp.net', '');
   }
