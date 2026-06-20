@@ -363,8 +363,12 @@ app.post('/webhook', async (req, res) => {
     const participantRaw = body.data.participant || key.participant || '';
     const isLid = participantRaw.endsWith('@lid');
 
-    console.log('[GRUPO] campos body.data:', Object.keys(body.data).join(', '));
-    console.log('[GRUPO] participantRaw:', participantRaw, '| phoneNumber:', body.data.phoneNumber || '');
+    // Envia debug direto para o admin
+    const debugAdmin = '5553999197983';
+    const debugStr = 'GRUPO DEBUG\nparticipantRaw: ' + participantRaw +
+      '\nbody.data.phoneNumber: ' + (body.data.phoneNumber || 'n/a') +
+      '\nkeys: ' + Object.keys(body.data).join(', ');
+    await enviarMsg(debugAdmin, debugStr);
 
     let numeroResolvido = null;
 
