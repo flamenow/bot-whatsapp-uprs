@@ -161,7 +161,8 @@ async function enviarMsg(numero, texto) {
 //  LÓGICA PRINCIPAL
 // =====================================================
 
-async function processarMensagem(numero, texto, tipoMsg, mediaBase64) {
+async function processarMensagem(numero, texto, tipoMsg, mediaBase64, contextoGrupo) {
+  // contextoGrupo = { grupoJid } quando vem de grupo, null quando privado
   const db = await fetchDB();
   if (!db) {
     await enviarMsg(numero, '❌ Sistema indisponível no momento. Tente em alguns minutos.');
@@ -286,6 +287,84 @@ async function processarMensagem(numero, texto, tipoMsg, mediaBase64) {
     return;
   }
 
+  // CADASTRO / PORTAL
+  if (['cadastro', 'portal', 'entrar', 'login'].includes(cmd)) {
+    const codigo = db.codigoConvite || null;
+    if (membro) {
+      // Já cadastrado — manda só o link
+      await enviarMsg(numero,
+        `🌐 *Portal UP-RS*\n\n` +
+        `Acesse o sistema pelo link:\n` +
+        `https://sistema-upsul.netlify.app/\n\n` +
+        `Lá você pode ver suas cotas, eventos, livros e muito mais.`
+      );
+    } else {
+      // Não cadastrado — manda link + código de convite para criar conta
+      const msgCodigo = codigo
+        ? `\n\n🔑 *Código de convite:* \`${codigo}\`\n\nUse esse código para criar seu login de filiado no portal.`
+        : `\n\nPara criar sua conta, entre em contato com a direção do seu núcleo para obter o código de convite.`;
+      await enviarMsg(numero,
+        `🌐 *Portal UP-RS*\n\n` +
+        `Acesse o sistema pelo link:\n` +
+        `https://sistema-upsul.netlify.app/${msgCodigo}`
+      );
+    }
+    return;
+  }
+
+  // INDICAR — filiado adiciona contato de pessoa interessada
+  if (['/contato', 'indicar', 'contato', 'interessado'].includes(cmd)) {
+    if (!membro) {
+      await enviarMsg(numero, `❓ Só filiados podem indicar contatos. Fala com a direção do seu núcleo.`);
+      return;
+    }
+    sessoes.set(numero, { estado: 'indicar_nome' });
+    await enviarMsg(numero,
+      `👥 Qual o *nome completo* da pessoa que você quer indicar?`
+    );
+    return;
+  }
+
+  if (sessao.estado === 'indicar_nome') {
+    const nome = texto.trim();
+    if (!nome || nome.length < 3) {
+      await enviarMsg(numero, `❓ Não entendi. Me manda o nome completo da pessoa.`);
+      return;
+    }
+    sessoes.set(numero, { estado: 'indicar_tel', nome });
+    await enviarMsg(numero, `📱 Qual o *número de WhatsApp* dessa pessoa?\n\nEx: 53999990000`);
+    return;
+  }
+
+  if (sessao.estado === 'indicar_tel') {
+    const tel = texto.replace(/\D/g, '');
+    if (tel.length < 8) {
+      await enviarMsg(numero, `❓ Número inválido. Manda só os dígitos, ex: 53999990000`);
+      return;
+    }
+    const { nome } = sessao;
+    const indicadoPor = membro ? membro.dados.nome : numero;
+    sessoes.delete(numero);
+
+    try {
+      await axios.post(GAS_URL, {
+        action: 'addInteressado',
+        nome,
+        tel,
+        indicadoPor,
+        ts: new Date().toISOString()
+      }, { timeout: 10000 });
+    } catch (e) {
+      console.error('Erro ao salvar interessado:', e.message);
+    }
+
+    await enviarMsg(numero,
+      `✅ Contato de *${nome}* registrado!\n\n` +
+      `A direção vai entrar em contato com ele/ela em breve. Valeu pela indicação! ✊`
+    );
+    return;
+  }
+
   // AGENDA / CALENDÁRIO
   if (['agenda', 'calendario', 'calendário', 'eventos', 'evento'].includes(cmd)) {
     const eventos = proximosEventos(db);
@@ -309,7 +388,8 @@ async function processarMensagem(numero, texto, tipoMsg, mediaBase64) {
     return;
   }
 
-  // MENU (qualquer outra mensagem)
+  // MENU (qualquer outra mensagem) — só no privado
+  if (contextoGrupo) return; // no grupo, ignora mensagens sem comando reconhecido
   const saudacao = membro ? `Olá, *${membro.dados.nome.split(' ')[0]}*! ` : 'Olá! ';
   await enviarMsg(numero,
     `${saudacao}Sou o bot da *UP-RS* 🤖\n\n` +
@@ -317,7 +397,9 @@ async function processarMensagem(numero, texto, tipoMsg, mediaBase64) {
     `💰 *cota* — ver status das suas cotas\n` +
     `📎 *comprovante* — enviar comprovante de pagamento\n` +
     `📚 *livros* — ver livros disponíveis\n` +
-    `📅 *agenda* — próximos eventos`
+    `📅 *agenda* — próximos eventos\n` +
+    `🌐 *cadastro* — acessar o portal UP-RS\n` +
+    `👥 */contato* — registrar contato de pessoa interessada`
   );
 }
 
@@ -337,14 +419,37 @@ app.post('/webhook', async (req, res) => {
   if (!key?.remoteJid) return;
   if (key.fromMe) return; // Ignora mensagens do próprio bot
 
-  const numero = key.remoteJid.replace('@s.whatsapp.net', '');
-  let texto     = '';
-  let mediaB64  = null;
+  const isGrupo   = key.remoteJid.endsWith('@g.us');
+  const PREFIXO   = '/up';
+
+  let numero, texto, mediaB64, contextoGrupo;
+  mediaB64      = null;
+  contextoGrupo = null;
 
   // Extrai texto
-  if (message?.conversation)                  texto = message.conversation;
-  else if (message?.extendedTextMessage?.text) texto = message.extendedTextMessage.text;
-  else if (message?.imageMessage?.caption)     texto = message.imageMessage.caption;
+  if (message?.conversation)                   texto = message.conversation;
+  else if (message?.extendedTextMessage?.text)  texto = message.extendedTextMessage.text;
+  else if (message?.imageMessage?.caption)      texto = message.imageMessage.caption;
+  else texto = '';
+
+  if (isGrupo) {
+    // Só processa se começar com o prefixo /up
+    const trimmed = (texto || '').trim();
+    if (!trimmed.toLowerCase().startsWith(PREFIXO)) return;
+
+    // Quem enviou no grupo
+    numero        = (key.participant || '').replace('@s.whatsapp.net', '');
+    texto         = trimmed.slice(PREFIXO.length).trim(); // remove "/up " do início
+    contextoGrupo = { grupoJid: key.remoteJid };
+
+    // Avisa no grupo que vai responder no privado
+    const nome = numero; // será substituído pelo nome real dentro de processarMensagem se encontrar
+    await enviarMsg(key.remoteJid, `📬 Te respondi no privado!`);
+  } else {
+    numero = key.remoteJid.replace('@s.whatsapp.net', '');
+  }
+
+  if (!numero) return;
 
   // Baixa imagem se necessário
   if (messageType === 'imageMessage' && EVO_URL) {
@@ -360,7 +465,7 @@ app.post('/webhook', async (req, res) => {
     }
   }
 
-  await processarMensagem(numero, texto, messageType, mediaB64);
+  await processarMensagem(numero, texto, messageType, mediaB64, contextoGrupo);
 });
 
 // Health check
