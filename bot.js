@@ -43,12 +43,14 @@ function encontrarMembro(db, numero) {
 
   const mil = (db.militantes || []).find(m => {
     const tel = (m.tel || '').replace(/\D/g, '');
+    if (!tel) return false; // ignora cadastros sem telefone
     return variantes.some(v => tel === v || tel.endsWith(v) || v.endsWith(tel));
   });
   if (mil) return { tipo: 'militante', dados: mil };
 
   const apo = (db.apoiadores || []).find(a => {
     const tel = (a.tel || '').replace(/\D/g, '');
+    if (!tel) return false; // ignora cadastros sem telefone
     return variantes.some(v => tel === v || tel.endsWith(v) || v.endsWith(tel));
   });
   if (apo) return { tipo: 'apoiador', dados: apo };
@@ -57,16 +59,30 @@ function encontrarMembro(db, numero) {
 }
 
 function statusCota(militante) {
-  const hoje   = new Date();
-  const cota   = parseFloat(militante.cota) || 0;
+  const hoje     = new Date();
+  const cota     = parseFloat(militante.cota) || 0;
   const pagamentos = militante.pagamentos || [];
   const mesesDevendo = [];
 
-  // Verifica os últimos 3 meses
-  for (let i = 0; i < 3; i++) {
-    const d  = new Date(hoje.getFullYear(), hoje.getMonth() - i, 1);
-    const ym = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    if (!pagamentos.some(p => p.mes === ym)) mesesDevendo.push(ym);
+  // Ponto de partida: mês da filiação (ou 12 meses atrás se não tiver filiação)
+  let inicio;
+  if (militante.filiacao) {
+    inicio = new Date(militante.filiacao);
+    inicio.setDate(1); // primeiro dia do mês
+  } else {
+    inicio = new Date(hoje.getFullYear(), hoje.getMonth() - 12, 1);
+  }
+
+  // Percorre todos os meses desde a filiação até o mês atual
+  const cursor = new Date(inicio.getFullYear(), inicio.getMonth(), 1);
+  const fimMes = new Date(hoje.getFullYear(), hoje.getMonth(), 1);
+
+  while (cursor <= fimMes) {
+    const ym = `${cursor.getFullYear()}-${String(cursor.getMonth() + 1).padStart(2, '0')}`;
+    if (!pagamentos.some(p => p.mes === ym)) {
+      mesesDevendo.push(ym);
+    }
+    cursor.setMonth(cursor.getMonth() + 1);
   }
 
   return { cota, mesesDevendo };
