@@ -334,10 +334,15 @@ app.post('/webhook', async (req, res) => {
 
     if (!ehComandoUp && !ehComandoContato) return;
 
-    numero        = (key.participant || '').replace('@s.whatsapp.net', '').replace('@lid', '');
+    // Evolution API v2: body.data.participant pode ter o JID real (@s.whatsapp.net)
+    // quando key.participant usa o formato LID (@lid)
+    const participantRaw = body.data.participant || key.participant || '';
+    numero        = participantRaw.replace('@s.whatsapp.net', '').replace('@lid', '');
     texto         = ehComandoContato ? 'contato' : trimmed.slice(PREFIXO.length).trim();
     contextoGrupo = { grupoJid: key.remoteJid };
 
+    const debugInfo = 'key.p=' + (key.participant||'') + ' | data.p=' + (body.data.participant||'') + ' | numero=' + numero;
+    console.log('[GRUPO]', debugInfo);
     await enviarMsg(key.remoteJid, 'Te respondi no privado! [debug: ' + numero + ']');
   } else {
     numero = key.remoteJid.replace('@s.whatsapp.net', '');
