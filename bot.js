@@ -24,8 +24,22 @@ async function fetchDB() {
   }
 }
 
+// Busca membro por telefone, consultando lidMap se for JID @lid
 function encontrarMembro(db, numero) {
-  const limpo = numero.replace(/\D/g, '');
+  let numParaBusca = numero;
+
+  // Se for JID com @lid, resolve via lidMap salvo no GAS
+  if (typeof numero === 'string' && numero.includes('@lid')) {
+    const lidNum = numero.replace('@lid', '');
+    const lidMap = db.lidMap || {};
+    if (lidMap[lidNum]) {
+      numParaBusca = lidMap[lidNum];
+    } else {
+      return null; // LID ainda nao vinculado
+    }
+  }
+
+  const limpo = numParaBusca.replace(/\D/g, '');
   const variantes = [limpo, '55' + limpo, limpo.replace(/^55/, '')];
 
   const mil = (db.militantes || []).find(m => {
@@ -43,6 +57,25 @@ function encontrarMembro(db, numero) {
   if (apo) return { tipo: 'apoiador', dados: apo };
 
   return null;
+}
+
+// Busca membro por CPF
+function encontrarMembroPorCpf(db, cpf) {
+  const limpo = cpf.replace(/\D/g, '');
+  const mil = (db.militantes || []).find(m => (m.cpf || '').replace(/\D/g, '') === limpo);
+  if (mil) return { tipo: 'militante', dados: mil };
+  const apo = (db.apoiadores || []).find(a => (a.cpf || '').replace(/\D/g, '') === limpo);
+  if (apo) return { tipo: 'apoiador', dados: apo };
+  return null;
+}
+
+// Salva mapeamento LID -> telefone no GAS para uso futuro
+async function salvarLidMap(lid, phone) {
+  try {
+    await axios.post(GAS_URL, { action: 'saveLidMap', lid, phone }, { timeout: 10000 });
+  } catch(e) {
+    console.error('Erro ao salvar lidMap:', e.message);
+  }
 }
 
 function statusCota(militante) {
@@ -125,30 +158,15 @@ async function enviarMsg(numero, texto) {
   }
 }
 
-// Tenta resolver LID -> numero de telefone via Evolution API
-async function resolverLid(lidJid, grupoJid) {
-  if (!EVO_URL || !EVO_KEY) return null;
-  // Tentativa 1: buscar participantes do grupo
-  try {
-    const r = await axios.get(
-      EVO_URL + '/group/findGroupInfos/' + EVO_INSTANCE,
-      { params: { groupJid: grupoJid }, headers: { apikey: EVO_KEY }, timeout: 8000 }
-    );
-    const participants = (r.data && (r.data.participants || r.data.members)) || [];
-    console.log('[resolverLid] participantes do grupo:', JSON.stringify(participants).slice(0, 500));
-    const lidNum = lidJid.replace('@lid', '');
-    const match = participants.find(function(p) {
-      const id = (p.id || p.jid || '').replace(/@.+$/, '');
-      return id === lidNum;
-    });
-    if (match) {
-      const matchId = match.id || match.jid || '';
-      if (matchId.endsWith('@s.whatsapp.net')) return matchId.replace('@s.whatsapp.net', '');
-    }
-  } catch(e) {
-    console.error('[resolverLid grupo erro]', e.message);
+function msgCota(membro, numero) {
+  const { cota, mesesDevendo } = statusCota(membro.dados);
+  const nome = membro.dados.nome.split(' ')[0];
+  if (mesesDevendo.length === 0) {
+    return 'Ola, ' + nome + '! Suas cotas estao em dia.\n\nCota mensal: R$ ' + cota + ',00\n\nObrigado pelo comprometimento!';
   }
-  return null;
+  const lista = mesesDevendo.map(m => '  - ' + fmtData(m) + ' - R$ ' + cota + ',00').join('\n');
+  const total = cota * mesesDevendo.length;
+  return 'Ola, ' + nome + '! Cotas pendentes:\n\n' + lista + '\n\nTotal: R$ ' + total + ',00\n\nPara enviar comprovante, manda *comprovante* aqui.';
 }
 
 async function processarMensagem(numero, texto, tipoMsg, mediaBase64, contextoGrupo) {
@@ -161,6 +179,7 @@ async function processarMensagem(numero, texto, tipoMsg, mediaBase64, contextoGr
   const membro = encontrarMembro(db, numero);
   const sessao = sessoes.get(numero) || {};
   const cmd    = (texto || '').toLowerCase().trim();
+  const isLid  = typeof numero === 'string' && numero.includes('@lid');
 
   // Estado: aguardando comprovante (imagem)
   if (sessao.estado === 'aguardando_comprovante' && tipoMsg === 'imageMessage') {
@@ -195,6 +214,42 @@ async function processarMensagem(numero, texto, tipoMsg, mediaBase64, contextoGr
     }
     sessoes.set(numero, { estado: 'aguardando_comprovante', mes });
     await enviarMsg(numero, 'Agora me manda a foto do comprovante referente a ' + fmtData(mes) + '.');
+    return;
+  }
+
+  // Estado: aguardando CPF para vincular LID (primeiro uso no grupo)
+  if (sessao.estado === 'aguardando_cpf_lid') {
+    const cpf = texto.replace(/\D/g, '');
+    if (cpf.length !== 11) {
+      await enviarMsg(numero, 'CPF invalido. Manda os 11 digitos sem pontos ou traco:\nEx: 12345678901');
+      return;
+    }
+    const membroCpf = encontrarMembroPorCpf(db, cpf);
+    if (!membroCpf) {
+      sessoes.delete(numero);
+      await enviarMsg(numero, 'CPF nao encontrado no cadastro. Fala com a direcao do teu nucleo.');
+      return;
+    }
+    // Salva o vinculo LID -> telefone no GAS
+    const lidNum = numero.replace('@lid', '');
+    const phone  = (membroCpf.dados.tel || '').replace(/\D/g, '');
+    await salvarLidMap(lidNum, phone);
+
+    const cmdPendente = sessao.cmdPendente || 'cota';
+    sessoes.delete(numero);
+
+    // Mostra resultado do comando pendente
+    await enviarMsg(numero, 'Cadastro vinculado com sucesso!');
+    if (['cota', 'cotas', 'pagamento', 'paguei'].includes(cmdPendente) && membroCpf.tipo === 'militante') {
+      await enviarMsg(numero, msgCota(membroCpf, numero));
+    } else if (['comprovante', 'comp', 'pagar'].includes(cmdPendente) && membroCpf.tipo === 'militante') {
+      sessoes.set(numero, { estado: 'aguardando_mes' });
+      const hoje = new Date();
+      const ex   = String(hoje.getMonth() + 1).padStart(2, '0') + '/' + hoje.getFullYear();
+      await enviarMsg(numero, 'Qual mes e o comprovante?\n\nEx: ' + ex);
+    } else {
+      await enviarMsg(numero, 'Agora voce pode usar todos os comandos no grupo. Tenta de novo!');
+    }
     return;
   }
 
@@ -239,23 +294,25 @@ async function processarMensagem(numero, texto, tipoMsg, mediaBase64, contextoGr
 
   if (['cota', 'cotas', 'pagamento', 'paguei'].includes(cmd)) {
     if (!membro || membro.tipo !== 'militante') {
-      await enviarMsg(numero, 'Nao encontrei seu cadastro.\n[debug numero: ' + numero + ']');
+      if (isLid) {
+        sessoes.set(numero, { estado: 'aguardando_cpf_lid', cmdPendente: cmd });
+        await enviarMsg(numero, 'Para verificar seu cadastro, me manda seu CPF (so os 11 digitos, sem pontos):');
+        return;
+      }
+      await enviarMsg(numero, 'Nao encontrei seu cadastro. Fala com a direcao do teu nucleo.');
       return;
     }
-    const { cota, mesesDevendo } = statusCota(membro.dados);
-    const nome = membro.dados.nome.split(' ')[0];
-    if (mesesDevendo.length === 0) {
-      await enviarMsg(numero, 'Ola, ' + nome + '! Suas cotas estao em dia.\n\nCota mensal: R$ ' + cota + ',00\n\nObrigado pelo comprometimento!');
-    } else {
-      const lista  = mesesDevendo.map(m => '  - ' + fmtData(m) + ' - R$ ' + cota + ',00').join('\n');
-      const total  = cota * mesesDevendo.length;
-      await enviarMsg(numero, 'Ola, ' + nome + '! Cotas pendentes:\n\n' + lista + '\n\nTotal: R$ ' + total + ',00\n\nPara enviar comprovante, manda *comprovante* aqui.');
-    }
+    await enviarMsg(numero, msgCota(membro, numero));
     return;
   }
 
   if (['comprovante', 'comp', 'pagar'].includes(cmd)) {
     if (!membro || membro.tipo !== 'militante') {
+      if (isLid) {
+        sessoes.set(numero, { estado: 'aguardando_cpf_lid', cmdPendente: cmd });
+        await enviarMsg(numero, 'Para verificar seu cadastro, me manda seu CPF (so os 11 digitos, sem pontos):');
+        return;
+      }
       await enviarMsg(numero, 'Nao encontrei seu cadastro. Fala com o nucleo.');
       return;
     }
@@ -346,9 +403,9 @@ app.post('/webhook', async (req, res) => {
   mediaB64      = null;
   contextoGrupo = null;
 
-  if (message && message.conversation)                   texto = message.conversation;
+  if (message && message.conversation)                                              texto = message.conversation;
   else if (message && message.extendedTextMessage && message.extendedTextMessage.text) texto = message.extendedTextMessage.text;
-  else if (message && message.imageMessage && message.imageMessage.caption) texto = message.imageMessage.caption;
+  else if (message && message.imageMessage && message.imageMessage.caption)         texto = message.imageMessage.caption;
   else texto = '';
 
   if (isGrupo) {
@@ -361,28 +418,9 @@ app.post('/webhook', async (req, res) => {
     if (!ehComandoUp && !ehComandoContato) return;
 
     const participantRaw = body.data.participant || key.participant || '';
-    const isLid = participantRaw.endsWith('@lid');
 
-    // Envia debug direto para o admin
-    const debugAdmin = '5553999197983';
-    const debugStr = 'GRUPO DEBUG\nparticipantRaw: ' + participantRaw +
-      '\nbody.data.phoneNumber: ' + (body.data.phoneNumber || 'n/a') +
-      '\nkeys: ' + Object.keys(body.data).join(', ');
-    await enviarMsg(debugAdmin, debugStr);
-
-    let numeroResolvido = null;
-
-    if (isLid) {
-      // Tenta resolver o LID para numero de telefone real
-      numeroResolvido = await resolverLid(participantRaw, key.remoteJid);
-      console.log('[GRUPO] LID resolvido para:', numeroResolvido || 'nao resolvido');
-    }
-
-    // Se resolveu via grupo, usa o telefone; se nao, usa o LID como numero (para envio via EVO)
-    if (numeroResolvido) {
-      numero = numeroResolvido;
-    } else if (isLid) {
-      // Tenta enviar ao JID @lid diretamente — Evolution API v2 pode aceitar
+    // Se for LID, mantemos o JID completo — Evolution API consegue entregar no privado
+    if (participantRaw.endsWith('@lid')) {
       numero = participantRaw; // ex: "57316523167927@lid"
     } else {
       numero = participantRaw.replace('@s.whatsapp.net', '');
