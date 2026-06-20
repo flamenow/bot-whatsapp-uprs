@@ -121,8 +121,34 @@ async function enviarMsg(numero, texto) {
       { headers: { apikey: EVO_KEY } }
     );
   } catch (e) {
-    console.error('Erro ao enviar mensagem:', e.message);
+    console.error('Erro ao enviar mensagem para ' + numero + ':', e.message);
   }
+}
+
+// Tenta resolver LID -> numero de telefone via Evolution API
+async function resolverLid(lidJid, grupoJid) {
+  if (!EVO_URL || !EVO_KEY) return null;
+  // Tentativa 1: buscar participantes do grupo
+  try {
+    const r = await axios.get(
+      EVO_URL + '/group/findGroupInfos/' + EVO_INSTANCE,
+      { params: { groupJid: grupoJid }, headers: { apikey: EVO_KEY }, timeout: 8000 }
+    );
+    const participants = (r.data && (r.data.participants || r.data.members)) || [];
+    console.log('[resolverLid] participantes do grupo:', JSON.stringify(participants).slice(0, 500));
+    const lidNum = lidJid.replace('@lid', '');
+    const match = participants.find(function(p) {
+      const id = (p.id || p.jid || '').replace(/@.+$/, '');
+      return id === lidNum;
+    });
+    if (match) {
+      const matchId = match.id || match.jid || '';
+      if (matchId.endsWith('@s.whatsapp.net')) return matchId.replace('@s.whatsapp.net', '');
+    }
+  } catch(e) {
+    console.error('[resolverLid grupo erro]', e.message);
+  }
+  return null;
 }
 
 async function processarMensagem(numero, texto, tipoMsg, mediaBase64, contextoGrupo) {
@@ -334,16 +360,34 @@ app.post('/webhook', async (req, res) => {
 
     if (!ehComandoUp && !ehComandoContato) return;
 
-    // Evolution API v2: body.data.participant pode ter o JID real (@s.whatsapp.net)
-    // quando key.participant usa o formato LID (@lid)
     const participantRaw = body.data.participant || key.participant || '';
-    numero        = participantRaw.replace('@s.whatsapp.net', '').replace('@lid', '');
+    const isLid = participantRaw.endsWith('@lid');
+
+    console.log('[GRUPO] campos body.data:', Object.keys(body.data).join(', '));
+    console.log('[GRUPO] participantRaw:', participantRaw, '| phoneNumber:', body.data.phoneNumber || '');
+
+    let numeroResolvido = null;
+
+    if (isLid) {
+      // Tenta resolver o LID para numero de telefone real
+      numeroResolvido = await resolverLid(participantRaw, key.remoteJid);
+      console.log('[GRUPO] LID resolvido para:', numeroResolvido || 'nao resolvido');
+    }
+
+    // Se resolveu via grupo, usa o telefone; se nao, usa o LID como numero (para envio via EVO)
+    if (numeroResolvido) {
+      numero = numeroResolvido;
+    } else if (isLid) {
+      // Tenta enviar ao JID @lid diretamente — Evolution API v2 pode aceitar
+      numero = participantRaw; // ex: "57316523167927@lid"
+    } else {
+      numero = participantRaw.replace('@s.whatsapp.net', '');
+    }
+
     texto         = ehComandoContato ? 'contato' : trimmed.slice(PREFIXO.length).trim();
     contextoGrupo = { grupoJid: key.remoteJid };
 
-    const debugInfo = 'key.p=' + (key.participant||'') + ' | data.p=' + (body.data.participant||'') + ' | numero=' + numero;
-    console.log('[GRUPO]', debugInfo);
-    await enviarMsg(key.remoteJid, 'Te respondi no privado! [debug: ' + numero + ']');
+    await enviarMsg(key.remoteJid, 'Te respondi no privado!');
   } else {
     numero = key.remoteJid.replace('@s.whatsapp.net', '');
   }
